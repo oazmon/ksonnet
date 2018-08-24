@@ -92,6 +92,7 @@ func NewGitHub(a app.App, registryRef *app.RegistryConfig, opts ...GitHubOpt) (*
 		return nil, err
 	}
 	gh.hd = hd
+	gh.SetBaseURL(hd.baseURL)
 
 	return gh, nil
 }
@@ -480,6 +481,7 @@ func (gh *GitHub) registrySpecRawURL() string {
 }
 
 type hubDescriptor struct {
+	baseURL         *url.URL
 	org             string
 	repo            string
 	refSpec         string
@@ -495,12 +497,12 @@ func (hd *hubDescriptor) Repo() github.Repo {
 func parseGitHubURI(uri string) (hd *hubDescriptor, err error) {
 	// Normalize URI.
 	uri = strings.TrimSpace(uri)
-	if strings.HasPrefix(uri, "http://github.com") || strings.HasPrefix(uri, "https://github.com") || strings.HasPrefix(uri, "http://www.github.com") || strings.HasPrefix(uri, "https://www.github.com") {
+	if strings.HasPrefix(uri, "http://github.") || strings.HasPrefix(uri, "https://github.") || strings.HasPrefix(uri, "http://www.github.") || strings.HasPrefix(uri, "https://www.github.") {
 		// Do nothing.
-	} else if strings.HasPrefix(uri, "github.com") || strings.HasPrefix(uri, "www.github.com") {
+	} else if strings.HasPrefix(uri, "github.") || strings.HasPrefix(uri, "www.github.") {
 		uri = "http://" + uri
 	} else {
-		return nil, errors.Errorf("Registries using protocol 'github' must provide URIs beginning with 'github.com' (optionally prefaced with 'http', 'https', 'www', and so on")
+		return nil, errors.Errorf("Registries using protocol 'github' must provide URIs beginning with 'github' (optionally prefaced with 'http', 'https', 'www', and so on")
 	}
 
 	parsed, err := url.Parse(uri)
@@ -508,21 +510,64 @@ func parseGitHubURI(uri string) (hd *hubDescriptor, err error) {
 		return nil, err
 	}
 
-	if len(parsed.Query()) != 0 {
-		return nil, errors.Errorf("No query strings allowed in registry URI:\n%s", uri)
-	}
-
 	components := strings.Split(parsed.Path, "/")
-	if len(components) < 3 {
+	fmt.Printf("DEBUG: path: %s\n", parsed.Path)
+
+	hd = &hubDescriptor{}
+	fmt.Printf("DEBUG: host: %s\n", parsed.Host)
+	isEnterprise := !strings.HasSuffix(parsed.Host, "github.com")
+	fmt.Printf("DEBUG: isEnterprise: %t\n", isEnterprise)
+	baseIndex := -1
+	if isEnterprise {
+		for i, n := range components {
+			if "repos" == n {
+				baseIndex = i
+				break
+			}
+		}
+		if baseIndex == -1 {
+			return nil, errors.Errorf("Enterprise GitHub URI must point at a repository's V3 API 'repos' endpoint:\n%s", uri)
+		}
+		hd.baseURL,_ = url.Parse(
+		parsed.Scheme + "://" + parsed.Host + strings.Join(components[:baseIndex], "/") + "/")
+
+		queries := parsed.Query()
+		fmt.Printf("DEBUG: queries: %s\n", queries)
+		switch len(queries) {
+		case 0:
+			hd.refSpec = ""
+		case 1:
+			refSpecs, ok := queries["ref"]
+			if ok && len(refSpecs) == 1 {
+				hd.refSpec = refSpecs[0]
+				break
+			}
+			fallthrough
+		default:
+			return nil, errors.Errorf("Only 'ref' query strings allowed in enterprise registry URI:\n%s", uri)
+		}
+		fmt.Printf("DEBUG: hd.refSpec: %s\n", hd.refSpec)
+	} else {
+		if len(parsed.Query()) != 0 {
+			return nil, errors.Errorf("No query strings allowed in registry URI:\n%s", uri)
+		}
+
+		hd.baseURL = nil
+		baseIndex = 0
+	}
+	fmt.Printf("DEBUG: baseURL: %d\n", hd.baseURL.String())
+	fmt.Printf("DEBUG: baseIndex: %d\n", baseIndex)
+
+	if len(components) < baseIndex+3 {
 		return nil, errors.Errorf("GitHub URI must point at a repository:\n%s", uri)
 	}
 
-	hd = &hubDescriptor{}
-
 	// NOTE: The first component is always blank, because the path
 	// begins like: '/whatever'.
-	hd.org = components[1]
-	hd.repo = components[2]
+	hd.org = components[baseIndex+1]
+	fmt.Printf("DEBUG: hd.org: %s\n", hd.org)
+	hd.repo = components[baseIndex+2]
+	fmt.Printf("DEBUG: hd.repo: %s\n", hd.repo)
 
 	//
 	// Parse out `regSpecRepoPath`. There are a few cases:
@@ -533,49 +578,75 @@ func parseGitHubURI(uri string) (hd *hubDescriptor, err error) {
 	//   * URI points at a repository root, e.g.,
 	//     'http://github.com/ksonnet/parts'
 	//
-	if len := len(components); len > 4 {
-		hd.refSpec = components[4]
+	//   Enterprise:
+	//   * URI points at a directory inside the enterprise respoitory, e.g.,
+	//     'https://github.my-company.com/api/v3/repos/my-org/ksonnet-parts/contents/registry?ref=master'
+	//   * URI points at an 'app.yaml' inside an enterprise repository, e.g.,
+	//     'https://github.my-company.com/api/v3/repos/my-org/ksonnet-parts/contents/registry/app.yaml?ref=master'
+	//   * URI points at a enterprise repository root, e.g.,
+	//     'https://github.my-company.com/api/v3/repos/my-org/ksonnet-parts?ref=master'
+	//
 
-		//
-		// Case where we're pointing at either a directory inside a GitHub
-		// URL, or an 'app.yaml' inside a GitHub URL.
-		//
-
-		// See note above about first component being blank.
-		if components[3] == "tree" {
+	// See note above about first component being blank.
+	if isEnterprise {
+		if len := len(components); len > baseIndex+4 {
 			// If we have a trailing '/' character, last component will be blank. Make
 			// sure that `regRepoPath` does not contain a trailing `/`.
 			if components[len-1] == "" {
-				hd.regRepoPath = strings.Join(components[5:len-1], "/")
+				hd.regRepoPath = strings.Join(components[baseIndex+4:len-1], "/")
+				fmt.Printf("DEBUG: hd.regRepoPath: %s\n", hd.regRepoPath)
 				components[len-1] = registryYAMLFile
 			} else {
-				hd.regRepoPath = strings.Join(components[5:], "/")
+				hd.regRepoPath = strings.Join(components[baseIndex+4:], "/")
+				fmt.Printf("DEBUG: hd.regRepoPath: %s\n", hd.regRepoPath)
 				components = append(components, registryYAMLFile)
 			}
-			hd.regSpecRepoPath = strings.Join(components[5:], "/")
-			return
-		} else if components[3] == "blob" && components[len-1] == registryYAMLFile {
-			hd.regRepoPath = strings.Join(components[5:len-1], "/")
-			// Path to the `yaml` (may or may not exist).
-			hd.regSpecRepoPath = strings.Join(components[5:], "/")
+			hd.regSpecRepoPath = strings.Join(components[baseIndex+4:], "/")
+			fmt.Printf("DEBUG: hd.regSpecRepoPath: %s\n", hd.regSpecRepoPath)
 			return
 		} else {
-			return nil, errInvalidURI
+			// Else, URI should point at repository root.
+			hd.refSpec = defaultGitHubBranch
+			hd.regRepoPath = ""
+			hd.regSpecRepoPath = registryYAMLFile
+			return
 		}
 	} else {
-		hd.refSpec = defaultGitHubBranch
+		hd.refSpec = components[baseIndex+4]
+		fmt.Printf("DEBUG: hd.refSpec: %s\n", hd.refSpec)
 
-		// Else, URI should point at repository root.
-		if components[len-1] == "" {
-			components[len-1] = defaultGitHubBranch
-			components = append(components, registryYAMLFile)
+		if len := len(components); len > baseIndex+4 {
+			//
+			// Case where we're pointing at either a directory inside a GitHub
+			// URL, or an 'app.yaml' inside a GitHub URL.
+			//
+			if components[baseIndex+3] == "tree" {
+				// If we have a trailing '/' character, last component will be blank. Make
+				// sure that `regRepoPath` does not contain a trailing `/`.
+				if components[len-1] == "" {
+					hd.regRepoPath = strings.Join(components[baseIndex+5:len-1], "/")
+					components[len-1] = registryYAMLFile
+				} else {
+					hd.regRepoPath = strings.Join(components[baseIndex+5:], "/")
+					components = append(components, registryYAMLFile)
+				}
+				hd.regSpecRepoPath = strings.Join(components[baseIndex+5:], "/")
+				return
+			} else if components[baseIndex+3] == "blob" && components[len-1] == registryYAMLFile {
+				hd.regRepoPath = strings.Join(components[baseIndex+5:len-1], "/")
+				// Path to the `yaml` (may or may not exist).
+				hd.regSpecRepoPath = strings.Join(components[baseIndex+5:], "/")
+				return
+			} else {
+				return nil, errInvalidURI
+			}
 		} else {
-			components = append(components, defaultGitHubBranch, registryYAMLFile)
+			// Else, URI should point at repository root.
+			hd.refSpec = defaultGitHubBranch
+			hd.regRepoPath = ""
+			hd.regSpecRepoPath = registryYAMLFile
+			return
 		}
-
-		hd.regRepoPath = ""
-		hd.regSpecRepoPath = registryYAMLFile
-		return
 	}
 }
 
@@ -699,4 +770,13 @@ func (gh *GitHub) ValidateURI(uri string) (bool, error) {
 	}
 
 	return true, nil
+}
+
+func (gh *GitHub) SetBaseURL(baseURL *url.URL) {
+	if baseURL == nil {
+		fmt.Printf("DEBUG!!! setting registry baseURL: DEFAULT\n")
+	} else {
+		fmt.Printf("DEBUG!!! setting registry baseURL: %s\n", baseURL.String())
+	} 
+	gh.ghClient.SetBaseURL(baseURL)
 }

@@ -61,6 +61,7 @@ func (c ContentSpec) String() string {
 
 // GitHub is an interface for communicating with GitHub.
 type GitHub interface {
+	SetBaseURL(*url.URL)
 	ValidateURL(u string) error
 	CommitSHA1(ctx context.Context, repo Repo, refSpec string) (string, error)
 	Contents(ctx context.Context, repo Repo, path, sha1 string) (*github.RepositoryContent, []*github.RepositoryContent, error)
@@ -79,6 +80,7 @@ func defaultHTTPClient() *http.Client {
 type defaultGitHub struct {
 	httpClient *http.Client
 	urlParse   func(string) (*url.URL, error)
+	baseURL    *url.URL
 }
 
 var _ GitHub = (*defaultGitHub)(nil)
@@ -92,6 +94,15 @@ func NewGitHub(httpClient *http.Client) GitHub {
 		httpClient: httpClient,
 		urlParse:   url.Parse,
 	}
+}
+
+func (dg *defaultGitHub) SetBaseURL(baseURL *url.URL) {
+	if baseURL == nil {
+		fmt.Printf("DEBUG!!! setting default baseURL: DEFAULT\n")
+	} else {
+		fmt.Printf("DEBUG!!! setting default baseURL: %s\n", baseURL.String())
+	}
+	dg.baseURL = baseURL
 }
 
 func (dg *defaultGitHub) ValidateURL(urlStr string) error {
@@ -153,5 +164,14 @@ func (dg *defaultGitHub) client() *github.Client {
 		httpClient = oauth2.NewClient(ctx, ts)
 	}
 
-	return github.NewClient(httpClient)
+
+	client := github.NewClient(httpClient)
+	if dg.baseURL != nil {
+		fmt.Printf("DEBUG!!! using baseURL: %s\n", dg.baseURL.String())
+		client.BaseURL = dg.baseURL
+		client.UploadURL = nil
+	} else {
+		fmt.Printf("DEBUG!!! using baseURL: DEFAULT\n")
+	}
+	return client
 }
